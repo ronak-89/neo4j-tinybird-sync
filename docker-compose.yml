@@ -1,0 +1,13 @@
+services:
+  neo4j-tinybird-backfill:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: neo4j-tinybird-backfill
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+    network_mode: host
+    command: ["python", "neo4j_tinybird_backfill.py"]
