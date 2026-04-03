@@ -1,16 +1,14 @@
 """
 Standalone Neo4j → Tinybird backfill script.
 
-This is Phase 4 backfill only:
 1) Runs the Phase 1.6 pre-step to fill missing HAS_INVENTORY.updated_at (only where NULL)
 2) Ingests full snapshots for:
    - HAS_INVENTORY links
    - StatusHistory nodes
    - Home summary nodes
-3) Advances Tinybird incremental watermarks after successful ingest of each stream
+3) Advances Tinybird incremental watermarks in Postgres after successful ingest of each stream
 
-Resumable via MongoDB checkpoint (same pattern as migrate_notification_error_logs):
-on failure or SIGINT/SIGTERM, re-run to continue from the last committed batch.
+Not resumable: each run processes all three streams from the beginning (SIGINT exits after the current batch).
 """
 
 from __future__ import annotations
@@ -34,11 +32,6 @@ if _script_dir not in sys.path:
 
 load_dotenv(os.path.join(_script_dir, ".env"))
 
-from utils.checkpoint import (
-    close_checkpoint_client,
-    load_checkpoint,
-    save_checkpoint,
-)
 from utils.db import get_db_conn_sync, neo4j_connection
 
 logger = logging.getLogger(__name__)
@@ -81,18 +74,66 @@ def _dt_to_unix_ms(value: Optional[datetime]) -> int:
     return int(value.timestamp() * 1000)
 
 
-def _checkpoint_dt_to_param(value: Any) -> Optional[datetime]:
-    """Restore datetime from checkpoint (Mongo may return str or datetime)."""
+def _neo4j_string_prop(value: Any) -> Optional[str]:
     if value is None:
         return None
-    if isinstance(value, datetime):
-        return value.astimezone(timezone.utc)
     if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
-        except ValueError:
+        s = value.strip()
+        return s or None
+    return str(value).strip() or None
+
+
+def _optional_uint32(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        v = float(value)
+        if v != v or v < 0:
             return None
+        iv = int(round(v))
+        if iv > 4294967295:
+            return None
+        return iv
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _optional_float64(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        v = float(value)
+        if v != v:
+            return None
+        return v
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _optional_uint8_verified(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return 1 if value else 0
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "1", "yes"):
+            return 1
+        if low in ("false", "0", "no", ""):
+            return 0
     return None
+
+
+def _home_created_at_required_iso(record: Dict[str, Any]) -> str:
+    for key in ("created_at", "updated_at", "status_updated_at", "sort_dt"):
+        iso = _neo4j_dt_to_iso(record.get(key))
+        if iso:
+            return iso
+    return "1970-01-01T00:00:00+00:00"
 
 
 @dataclass(frozen=True)
@@ -156,6 +197,22 @@ def _run_pre_step_fill_updated_at(neo4j_session) -> int:
     return int(record["updated_count"]) if record and record.get("updated_count") is not None else 0
 
 
+def _run_pre_step_fill_home_updated_at(neo4j_session) -> int:
+    """
+    Pre-step for this migration:
+    Fill Home.updated_at only where it is missing.
+    Returns count of nodes updated.
+    """
+    cypher = """
+    MATCH (h:Home)
+    WHERE h.updated_at IS NULL
+    SET h.updated_at = coalesce(h.status_updated_at, h.created_at)
+    RETURN count(h) AS updated_count
+    """
+    record = neo4j_session.run(cypher).single()
+    return int(record["updated_count"]) if record and record.get("updated_count") is not None else 0
+
+
 def _fetch_inventory_batch(
     neo4j_session,
     *,
@@ -168,22 +225,19 @@ def _fetch_inventory_batch(
     Using (updated_at, elementId) caused infinite loops: Python/Neo4j datetime equality
     and the second batch predicate often failed, so the same first page repeated forever.
     """
-    # Paginate on distinct relationships first. OPTIONAL MATCH (Rooms) can multiply rows
-    # per r; LIMIT then applied to those rows breaks keyset pagination (cursor == last row id).
+    # Paginate on distinct relationships first.
     cypher = """
     MATCH (h:Home)-[r:HAS_INVENTORY]->(i:Inventory)
     WHERE ($cursor_eid IS NULL OR $cursor_eid = '' OR elementId(r) > $cursor_eid)
     WITH r, h, i
     ORDER BY elementId(r) ASC
     LIMIT $batch_size
-    OPTIONAL MATCH (rm:Rooms {id: r.room_id})
     RETURN
-        h.id AS home_id,
+        coalesce(h.id, h.home_id) AS home_id,
         h.user_id AS user_id,
         i.id AS inventory_id,
         elementId(r) AS neo4j_rel_element_id,
-        r.room_id AS room_id,
-        rm.room_name AS room_name,
+        r.purchase_date AS purchase_date,
         r.status AS status,
         r.quantity AS quantity,
         r.confirmation_status AS confirmation_status,
@@ -201,17 +255,19 @@ def _fetch_inventory_batch(
         rel_updated_dt = _neo4j_dt_to_dt(record.get("link_updated_at"))
         link_created_raw = record.get("link_created_at") or record.get("link_updated_at")
         link_created_iso = _neo4j_dt_to_iso(link_created_raw) or "1970-01-01T00:00:00+00:00"
+        # Use the same semantics as the incremental cron: the "effective" timestamp is updated_at when present,
+        # otherwise created_at. This prevents watermark_ts from getting stuck when link_updated_at is NULL.
         version_dt = rel_updated_dt or _neo4j_dt_to_dt(record.get("link_created_at")) or _neo4j_dt_to_dt(
             record.get("link_updated_at")
         )
+        rel_updated_dt = version_dt
         rows.append(
             {
                 "home_id": record.get("home_id"),
                 "user_id": record.get("user_id"),
                 "inventory_id": record.get("inventory_id"),
                 "neo4j_rel_element_id": record.get("neo4j_rel_element_id"),
-                "room_id": record.get("room_id"),
-                "room_name": record.get("room_name"),
+                "purchase_date": _neo4j_dt_to_iso(record.get("purchase_date")),
                 "status": record.get("status"),
                 "quantity": record.get("quantity"),
                 "confirmation_status": (
@@ -240,7 +296,7 @@ def _fetch_status_batch(
       (sh.created_at = $cursor_created AND toString(sh.id) > $cursor_sid))
     RETURN
         sh.id AS id,
-        h.id AS home_id,
+        coalesce(h.id, h.home_id) AS home_id,
         sh.status AS status,
         sh.priority AS priority,
         sh.reason AS reason,
@@ -278,17 +334,19 @@ def _fetch_home_batch(
     neo4j_session,
     *,
     batch_size: int,
-    cursor_sort: Optional[Any],
     cursor_hid: Optional[str],
 ) -> list[Dict[str, Any]]:
+    """
+    Keyset pagination on coalesce(h.id, h.home_id) (legacy nodes may only have home_id).
+
+    (sort_dt, id) pagination skipped every Home where coalesce(updated_at, status_updated_at, created_at)
+    was NULL after the first page — often leaving only one batch (e.g. 17 rows) ingested.
+    """
     cypher = """
     MATCH (h:Home)
-    WITH h, coalesce(h.status_updated_at, h.created_at) AS sort_dt
-    WHERE ($cursor_sort IS NULL OR
-      sort_dt > $cursor_sort OR
-      (sort_dt = $cursor_sort AND h.id > $cursor_hid))
+    WHERE ($cursor_hid IS NULL OR $cursor_hid = '' OR coalesce(h.id, h.home_id) > $cursor_hid)
     RETURN
-        h.id AS home_id,
+        coalesce(h.id, h.home_id) AS home_id,
         h.user_id AS user_id,
         h.status AS status,
         h.priority AS priority,
@@ -305,40 +363,44 @@ def _fetch_home_batch(
         h.country AS country,
         h.is_address_verified AS is_address_verified,
         h.created_at AS created_at,
+        h.updated_at AS updated_at,
         h.status_updated_at AS status_updated_at,
-        sort_dt
-    ORDER BY sort_dt ASC, h.id ASC
+        coalesce(h.updated_at, h.status_updated_at, h.created_at) AS sort_dt
+    ORDER BY coalesce(h.id, h.home_id) ASC
     LIMIT $batch_size
     """
     result = neo4j_session.run(
         cypher,
-        cursor_sort=cursor_sort,
-        cursor_hid=cursor_hid or "",
+        cursor_hid=cursor_hid if cursor_hid else None,
         batch_size=batch_size,
     )
     rows: list[Dict[str, Any]] = []
     for record in result:
         is_verified = record.get("is_address_verified")
         sort_dt = _neo4j_dt_to_dt(record.get("sort_dt"))
+        hid = _neo4j_string_prop(record.get("home_id"))
+        if hid is None:
+            continue
         rows.append(
             {
-                "home_id": record.get("home_id"),
-                "user_id": record.get("user_id"),
-                "status": record.get("status"),
-                "priority": record.get("priority"),
-                "city": record.get("city"),
-                "state": record.get("state"),
-                "zipcode": record.get("zipcode"),
-                "nickname": record.get("nickname"),
-                "home_type": record.get("home_type"),
-                "bedrooms": record.get("bedrooms"),
-                "bathrooms": record.get("bathrooms"),
-                "sqft": record.get("sqft"),
-                "latitude": record.get("latitude"),
-                "longitude": record.get("longitude"),
-                "country": record.get("country"),
-                "is_address_verified": int(is_verified) if is_verified is not None else None,
-                "created_at": _neo4j_dt_to_iso(record.get("created_at")),
+                "home_id": hid,
+                "user_id": _neo4j_string_prop(record.get("user_id")),
+                "status": _neo4j_string_prop(record.get("status")),
+                "priority": _neo4j_string_prop(record.get("priority")),
+                "city": _neo4j_string_prop(record.get("city")),
+                "state": _neo4j_string_prop(record.get("state")),
+                "zipcode": _neo4j_string_prop(record.get("zipcode")),
+                "nickname": _neo4j_string_prop(record.get("nickname")),
+                "home_type": _neo4j_string_prop(record.get("home_type")),
+                "bedrooms": _optional_uint32(record.get("bedrooms")),
+                "bathrooms": _optional_uint32(record.get("bathrooms")),
+                "sqft": _optional_uint32(record.get("sqft")),
+                "latitude": _optional_float64(record.get("latitude")),
+                "longitude": _optional_float64(record.get("longitude")),
+                "country": _neo4j_string_prop(record.get("country")),
+                "is_address_verified": _optional_uint8_verified(is_verified),
+                "created_at": _home_created_at_required_iso(record),
+                "updated_at": _neo4j_dt_to_iso(record.get("updated_at")),
                 "status_updated_at": _neo4j_dt_to_iso(record.get("status_updated_at")),
                 "row_version_ms": _dt_to_unix_ms(sort_dt),
                 "status_updated_dt": sort_dt,
@@ -379,35 +441,14 @@ _shutdown_requested = False
 def _handle_signal(_signum, _frame):
     global _shutdown_requested
     _shutdown_requested = True
-    logger.info("Shutdown requested; will save checkpoint and exit after current batch")
+    logger.info("Shutdown requested; exiting after current batch")
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Neo4j → Tinybird backfill job")
     parser.add_argument("--batch-size", type=int, default=int(os.getenv("BATCH_SIZE", "500")))
     parser.add_argument("--limit", type=int, default=None, help="Optional hard cap on total rows per stream (debug)")
-    parser.add_argument(
-        "--from-start",
-        action="store_true",
-        help="Ignore Mongo checkpoint and process all streams from the beginning",
-    )
-    parser.add_argument(
-        "--no-checkpoint",
-        action="store_true",
-        help="Do not load/save Mongo checkpoints (not resumable)",
-    )
     return parser.parse_args()
-
-
-DEFAULT_CHECKPOINT: Dict[str, Any] = {
-    "phase": "inventory",
-    "inventory_updated_at": None,
-    "inventory_element_id": None,
-    "status_created_at": None,
-    "status_id": None,
-    "home_sort_dt": None,
-    "home_id": None,
-}
 
 
 def main() -> None:
@@ -424,9 +465,6 @@ def main() -> None:
     if not tinybird_token:
         raise RuntimeError("TINYBIRD_TOKEN is required")
 
-    mongo_collection = os.getenv("MONGO_CHECKPOINT_COLLECTION", "neo4j_tinybird_backfill")
-    checkpoint_id = os.getenv("MONGO_CHECKPOINT_ID", "neo4j_tinybird_backfill")
-
     cfg = SyncConfig(
         tinybird_base_url=tinybird_base_url,
         tinybird_token=tinybird_token,
@@ -435,36 +473,12 @@ def main() -> None:
         home_datasource="neo4j_home_summary",
     )
 
-    use_checkpoint = not args.no_checkpoint
-    cp: Dict[str, Any] = dict(DEFAULT_CHECKPOINT)
-
-    if use_checkpoint:
-        try:
-            cp = load_checkpoint(mongo_collection, checkpoint_id, DEFAULT_CHECKPOINT)
-        except Exception as e:
-            logger.warning("Could not load checkpoint (will start from beginning): %s", e)
-            cp = dict(DEFAULT_CHECKPOINT)
-
-    if args.from_start:
-        cp = dict(DEFAULT_CHECKPOINT)
-        logger.info("--from-start: ignoring checkpoint")
-
-    if use_checkpoint and cp.get("phase") == "done":
-        logger.info("Checkpoint says job is already complete (phase=done). Nothing to do.")
-        close_checkpoint_client()
-        return
-
     pg_conn = get_db_conn_sync()
     driver = neo4j_connection.connect()
     neo4j_session = driver.session()
 
     def should_stop() -> bool:
         return _shutdown_requested
-
-    def save_cp(data: dict) -> None:
-        if not use_checkpoint:
-            return
-        save_checkpoint(mongo_collection, checkpoint_id, data)
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -473,83 +487,65 @@ def main() -> None:
         updated_count = _run_pre_step_fill_updated_at(neo4j_session)
         logger.info("Pre-step updated HAS_INVENTORY.updated_at where NULL: %s", updated_count)
 
-        phase = str(cp.get("phase") or "inventory")
+        updated_home_count = _run_pre_step_fill_home_updated_at(neo4j_session)
+        logger.info("Pre-step updated Home.updated_at where NULL: %s", updated_home_count)
 
         with requests.Session() as http:
             # --- inventory ---
-            if phase == "inventory":
-                cur_eid = cp.get("inventory_element_id")
-                if cur_eid is not None:
-                    cur_eid = str(cur_eid).strip() or None
-                max_inv: Optional[datetime] = None
-                rows_left = args.limit
-                while not should_stop():
-                    take = args.batch_size if rows_left is None else min(args.batch_size, rows_left)
-                    if take <= 0:
-                        break
-                    batch = _fetch_inventory_batch(
-                        neo4j_session,
-                        batch_size=take,
-                        cursor_eid=cur_eid,
+            cur_eid: Optional[str] = None
+            max_inv: Optional[datetime] = None
+            rows_left = args.limit
+            while not should_stop():
+                take = args.batch_size if rows_left is None else min(args.batch_size, rows_left)
+                if take <= 0:
+                    break
+                batch = _fetch_inventory_batch(
+                    neo4j_session,
+                    batch_size=take,
+                    cursor_eid=cur_eid,
+                )
+                if not batch:
+                    break
+                norm, batch_max = _normalize_batch_for_tinybird(batch, "rel_updated_dt")
+                resp = _post_events_ndjson(
+                    http,
+                    base_url=cfg.tinybird_base_url,
+                    token=cfg.tinybird_token,
+                    datasource=cfg.inventory_datasource,
+                    events=norm,
+                )
+                if resp.status_code not in (200, 202):
+                    raise RuntimeError(f"Failed Tinybird ingest: {resp.status_code}: {resp.text[:300]}")
+                max_inv = _merge_max_dt(max_inv, batch_max)
+                last = batch[-1]
+                next_eid = str(last.get("neo4j_rel_element_id") or "").strip()
+                if not next_eid:
+                    raise RuntimeError(
+                        "Inventory row missing neo4j_rel_element_id; cannot advance Neo4j cursor"
                     )
-                    if not batch:
-                        break
-                    norm, batch_max = _normalize_batch_for_tinybird(batch, "rel_updated_dt")
-                    resp = _post_events_ndjson(
-                        http,
-                        base_url=cfg.tinybird_base_url,
-                        token=cfg.tinybird_token,
-                        datasource=cfg.inventory_datasource,
-                        events=norm,
+                if next_eid == cur_eid:
+                    raise RuntimeError(
+                        "Neo4j inventory cursor did not advance (duplicate element id); aborting to avoid a loop"
                     )
-                    if resp.status_code not in (200, 202):
-                        raise RuntimeError(f"Failed Tinybird ingest: {resp.status_code}: {resp.text[:300]}")
-                    max_inv = _merge_max_dt(max_inv, batch_max)
-                    last = batch[-1]
-                    next_eid = str(last.get("neo4j_rel_element_id") or "").strip()
-                    if not next_eid:
-                        raise RuntimeError(
-                            "Inventory row missing neo4j_rel_element_id; cannot advance Neo4j cursor"
-                        )
-                    if next_eid == cur_eid:
-                        raise RuntimeError(
-                            "Neo4j inventory cursor did not advance (duplicate element id); aborting to avoid a loop"
-                        )
-                    cur_eid = next_eid
-                    last_ts = last.get("rel_updated_dt")
-                    rows_sent = len(batch)
-                    rows_left = None if rows_left is None else rows_left - rows_sent
-                    logger.info(
-                        "Ingested inventory batch (%s rows); max dt for watermark=%s; cursor elementId=%s",
-                        rows_sent,
-                        max_inv,
-                        cur_eid[:48] + "..." if len(cur_eid) > 48 else cur_eid,
-                    )
-                    save_cp(
-                        {
-                            **DEFAULT_CHECKPOINT,
-                            "phase": "inventory",
-                            "inventory_updated_at": last_ts.isoformat() if isinstance(last_ts, datetime) else None,
-                            "inventory_element_id": cur_eid,
-                        }
-                    )
-                    if should_stop():
-                        logger.info("Checkpoint saved; exiting")
-                        return
-                if max_inv:
-                    _set_watermark(pg_conn, cfg.inventory_datasource, max_inv)
-                if not should_stop():
-                    merged = {**DEFAULT_CHECKPOINT, "phase": "status"}
-                    save_cp(merged)
-                    cp.update(merged)
-                phase = "status"
+                cur_eid = next_eid
+                rows_sent = len(batch)
+                rows_left = None if rows_left is None else rows_left - rows_sent
+                logger.info(
+                    "Ingested inventory batch (%s rows); max dt for watermark=%s; cursor elementId=%s",
+                    rows_sent,
+                    max_inv,
+                    cur_eid[:48] + "..." if len(cur_eid) > 48 else cur_eid,
+                )
+                if should_stop():
+                    logger.info("Interrupted; exiting before status stream")
+                    return
+            if max_inv:
+                _set_watermark(pg_conn, cfg.inventory_datasource, max_inv)
 
             # --- status ---
-            if phase == "status" and not should_stop():
-                cur_created = _checkpoint_dt_to_param(cp.get("status_created_at"))
-                cur_sid = cp.get("status_id")
-                if cur_sid is not None:
-                    cur_sid = str(cur_sid)
+            if not should_stop():
+                cur_created: Optional[datetime] = None
+                cur_sid: Optional[str] = None
                 max_status: Optional[datetime] = None
                 rows_left = args.limit
                 while not should_stop():
@@ -585,31 +581,15 @@ def main() -> None:
                         rows_sent,
                         max_status,
                     )
-                    save_cp(
-                        {
-                            **DEFAULT_CHECKPOINT,
-                            "phase": "status",
-                            "status_created_at": cur_created.isoformat() if isinstance(cur_created, datetime) else None,
-                            "status_id": cur_sid,
-                        }
-                    )
                     if should_stop():
-                        logger.info("Checkpoint saved; exiting")
+                        logger.info("Interrupted; exiting before home stream")
                         return
                 if max_status:
                     _set_watermark(pg_conn, cfg.status_datasource, max_status)
-                if not should_stop():
-                    merged = {**DEFAULT_CHECKPOINT, "phase": "home"}
-                    save_cp(merged)
-                    cp.update(merged)
-                phase = "home"
 
             # --- home ---
-            if phase == "home" and not should_stop():
-                cur_sort = _checkpoint_dt_to_param(cp.get("home_sort_dt"))
-                cur_hid = cp.get("home_id")
-                if cur_hid is not None:
-                    cur_hid = str(cur_hid)
+            if not should_stop():
+                cur_hid: Optional[str] = None
                 max_home: Optional[datetime] = None
                 rows_left = args.limit
                 while not should_stop():
@@ -619,7 +599,6 @@ def main() -> None:
                     batch = _fetch_home_batch(
                         neo4j_session,
                         batch_size=take,
-                        cursor_sort=cur_sort,
                         cursor_hid=cur_hid,
                     )
                     if not batch:
@@ -636,30 +615,27 @@ def main() -> None:
                         raise RuntimeError(f"Failed Tinybird ingest: {resp.status_code}: {resp.text[:300]}")
                     max_home = _merge_max_dt(max_home, batch_max)
                     last = batch[-1]
-                    cur_sort = last.get("status_updated_dt") or cur_sort
-                    cur_hid = str(last.get("home_id") or "")
+                    next_hid = str(last.get("home_id") or "").strip()
+                    if not next_hid:
+                        raise RuntimeError("Home row missing home_id; cannot advance Neo4j cursor")
+                    if next_hid == cur_hid:
+                        raise RuntimeError(
+                            "Neo4j home cursor did not advance (duplicate home id); aborting to avoid a loop"
+                        )
+                    cur_hid = next_hid
                     rows_sent = len(batch)
                     rows_left = None if rows_left is None else rows_left - rows_sent
                     logger.info(
-                        "Ingested home batch (%s rows); max dt for watermark=%s",
+                        "Ingested home batch (%s rows); max dt for watermark=%s; cursor home_id=%s",
                         rows_sent,
                         max_home,
-                    )
-                    save_cp(
-                        {
-                            **DEFAULT_CHECKPOINT,
-                            "phase": "home",
-                            "home_sort_dt": cur_sort.isoformat() if isinstance(cur_sort, datetime) else None,
-                            "home_id": cur_hid,
-                        }
+                        cur_hid[:36] + "..." if len(cur_hid) > 36 else cur_hid,
                     )
                     if should_stop():
-                        logger.info("Checkpoint saved; exiting")
+                        logger.info("Interrupted during home stream")
                         return
                 if max_home:
                     _set_watermark(pg_conn, cfg.home_datasource, max_home)
-                if not should_stop():
-                    save_cp({**DEFAULT_CHECKPOINT, "phase": "done"})
 
         logger.info("Backfill complete.")
     finally:
@@ -671,7 +647,6 @@ def main() -> None:
             pg_conn.close()
         except Exception:  # noqa: BLE001
             pass
-        close_checkpoint_client()
 
 
 if __name__ == "__main__":
