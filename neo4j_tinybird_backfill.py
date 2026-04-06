@@ -185,12 +185,15 @@ def _run_pre_step_fill_updated_at(neo4j_session) -> int:
     """
     Phase 1.6 pre-step:
     Fill HAS_INVENTORY.updated_at only where it is missing.
-    Returns count of relationships updated.
+
+    If both updated_at and created_at are NULL, coalesce(created_at) stays NULL and SET would
+    not change the relationship — the same rows would match on every run. Fall back to
+    transaction datetime() so updated_at is written once.
     """
     cypher = """
     MATCH ()-[r:HAS_INVENTORY]->()
     WHERE r.updated_at IS NULL
-    SET r.updated_at = coalesce(r.updated_at, r.created_at)
+    SET r.updated_at = coalesce(r.created_at, datetime())
     RETURN count(r) AS updated_count
     """
     record = neo4j_session.run(cypher).single()
@@ -201,12 +204,12 @@ def _run_pre_step_fill_home_updated_at(neo4j_session) -> int:
     """
     Pre-step for this migration:
     Fill Home.updated_at only where it is missing.
-    Returns count of nodes updated.
+    Same coalesce fallback as HAS_INVENTORY when status_updated_at and created_at are both NULL.
     """
     cypher = """
     MATCH (h:Home)
     WHERE h.updated_at IS NULL
-    SET h.updated_at = coalesce(h.status_updated_at, h.created_at)
+    SET h.updated_at = coalesce(h.status_updated_at, h.created_at, datetime())
     RETURN count(h) AS updated_count
     """
     record = neo4j_session.run(cypher).single()
@@ -286,14 +289,21 @@ def _fetch_status_batch(
     neo4j_session,
     *,
     batch_size: int,
-    cursor_created: Optional[Any],
-    cursor_sid: Optional[str],
+    cursor_rel_eid: Optional[str],
 ) -> list[Dict[str, Any]]:
+    """
+    Keyset pagination on elementId(r) for :HAS_STATUS_HISTORY.
+
+    Paginating by (created_at, sh.id) breaks when Neo4j temporal equality does not match
+    the Python datetime passed back as a parameter, or when created_dt is null — the
+    cursor never advances and the same batch is ingested forever.
+    """
     cypher = """
-    MATCH (h:Home)-[:HAS_STATUS_HISTORY]->(sh:StatusHistory)
-    WHERE ($cursor_created IS NULL OR
-      sh.created_at > $cursor_created OR
-      (sh.created_at = $cursor_created AND toString(sh.id) > $cursor_sid))
+    MATCH (h:Home)-[r:HAS_STATUS_HISTORY]->(sh:StatusHistory)
+    WHERE ($cursor_rel_eid IS NULL OR $cursor_rel_eid = '' OR elementId(r) > $cursor_rel_eid)
+    WITH r, h, sh
+    ORDER BY elementId(r) ASC
+    LIMIT $batch_size
     RETURN
         sh.id AS id,
         coalesce(h.id, h.home_id) AS home_id,
@@ -302,14 +312,13 @@ def _fetch_status_batch(
         sh.reason AS reason,
         sh.notes AS notes,
         sh.user_id AS user_id,
-        sh.created_at AS created_at
-    ORDER BY sh.created_at ASC, toString(sh.id) ASC
-    LIMIT $batch_size
+        sh.created_at AS created_at,
+        elementId(r) AS neo4j_rel_element_id
+    ORDER BY elementId(r) ASC
     """
     result = neo4j_session.run(
         cypher,
-        cursor_created=cursor_created,
-        cursor_sid=cursor_sid or "",
+        cursor_rel_eid=cursor_rel_eid if cursor_rel_eid else None,
         batch_size=batch_size,
     )
     rows: list[Dict[str, Any]] = []
@@ -325,6 +334,7 @@ def _fetch_status_batch(
                 "user_id": record.get("user_id"),
                 "created_at": _neo4j_dt_to_iso(record.get("created_at")),
                 "created_dt": _neo4j_dt_to_dt(record.get("created_at")),
+                "neo4j_rel_element_id": record.get("neo4j_rel_element_id"),
             }
         )
     return rows
@@ -412,6 +422,8 @@ def _fetch_home_batch(
 def _normalize_batch_for_tinybird(
     batch: list[Dict[str, Any]],
     watermark_internal_dt_key: str,
+    *,
+    extra_internal_keys: Tuple[str, ...] = (),
 ) -> Tuple[list[Dict[str, Any]], Optional[datetime]]:
     """Strip internal keys and compute max watermark datetime for the batch."""
     max_dt: Optional[datetime] = None
@@ -423,6 +435,8 @@ def _normalize_batch_for_tinybird(
                 max_dt = internal_dt
         ev = dict(ev)
         ev.pop(watermark_internal_dt_key, None)
+        for k in extra_internal_keys:
+            ev.pop(k, None)
         normalized.append(ev)
     return normalized, max_dt
 
@@ -544,8 +558,7 @@ def main() -> None:
 
             # --- status ---
             if not should_stop():
-                cur_created: Optional[datetime] = None
-                cur_sid: Optional[str] = None
+                cur_status_rel_eid: Optional[str] = None
                 max_status: Optional[datetime] = None
                 rows_left = args.limit
                 while not should_stop():
@@ -555,12 +568,15 @@ def main() -> None:
                     batch = _fetch_status_batch(
                         neo4j_session,
                         batch_size=take,
-                        cursor_created=cur_created,
-                        cursor_sid=cur_sid,
+                        cursor_rel_eid=cur_status_rel_eid,
                     )
                     if not batch:
                         break
-                    norm, batch_max = _normalize_batch_for_tinybird(batch, "created_dt")
+                    norm, batch_max = _normalize_batch_for_tinybird(
+                        batch,
+                        "created_dt",
+                        extra_internal_keys=("neo4j_rel_element_id",),
+                    )
                     resp = _post_events_ndjson(
                         http,
                         base_url=cfg.tinybird_base_url,
@@ -572,14 +588,23 @@ def main() -> None:
                         raise RuntimeError(f"Failed Tinybird ingest: {resp.status_code}: {resp.text[:300]}")
                     max_status = _merge_max_dt(max_status, batch_max)
                     last = batch[-1]
-                    cur_created = last.get("created_dt") or cur_created
-                    cur_sid = str(last.get("id") or "")
+                    next_status_eid = str(last.get("neo4j_rel_element_id") or "").strip()
+                    if not next_status_eid:
+                        raise RuntimeError(
+                            "Status row missing neo4j_rel_element_id; cannot advance Neo4j cursor"
+                        )
+                    if next_status_eid == cur_status_rel_eid:
+                        raise RuntimeError(
+                            "Neo4j status cursor did not advance (duplicate relationship element id); aborting"
+                        )
+                    cur_status_rel_eid = next_status_eid
                     rows_sent = len(batch)
                     rows_left = None if rows_left is None else rows_left - rows_sent
                     logger.info(
-                        "Ingested status batch (%s rows); max dt for watermark=%s",
+                        "Ingested status batch (%s rows); max dt for watermark=%s; cursor rel elementId=%s",
                         rows_sent,
                         max_status,
+                        cur_status_rel_eid[:48] + "..." if len(cur_status_rel_eid) > 48 else cur_status_rel_eid,
                     )
                     if should_stop():
                         logger.info("Interrupted; exiting before home stream")
